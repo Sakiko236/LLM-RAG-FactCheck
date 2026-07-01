@@ -42,22 +42,22 @@ def write_index(embeddings):
 def embed(my_dict):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model = SentenceTransformer('sentence-transformers/paraphrase-MiniLM-L3-v2', device=device)
+    model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device=device)
     sentences = list(my_dict.values())
     embeddings = model.encode(sentences, batch_size=512, show_progress_bar=True)
 
     return embeddings
 
 
-def search(index, query_embeddings):
+def search(index, query_embeddings, top_k=5):
     index.nprobe = 10
-    k = 5
+    k = top_k
 
     distances, indices = index.search(query_embeddings, k)
-    print("最近邻索引 ID:", indices)
-    print("相似度分值:", distances)
 
-    return indices
+    prefixed_indices = [[f"evidence-{item}" for item in sublist] for sublist in indices]
+
+    return prefixed_indices
 
 
 def load_test_claims(json_path):
@@ -123,7 +123,7 @@ def encode_bm25(input_dict, max_features=100000, k1=1.5, b=0.75):
         'vocabulary': vectorizer.vocabulary_
     }
 
-    print(f"矩阵形状 (Shape): {bm25_matrix.shape}")
+    print(f"BM25矩阵形状 (Shape): {bm25_matrix.shape}")
     
     return bm25_matrix, meta_data
 
@@ -155,7 +155,7 @@ def search_bm25(queries, bm25_matrix, meta_data, top_k=5):
         
         # 如果查询词全都不在词表中，或者没有任何文档包含查询词
         if len(scores) == 0:
-            results.append({"query": queries[i], "hits": []})
+            indices.append([])
             continue
             
         # 5. 高效寻找 Top-K
@@ -174,115 +174,38 @@ def search_bm25(queries, bm25_matrix, meta_data, top_k=5):
         
         indices.append(top_k_doc_indices.tolist())
         distances.append(top_k_scores.tolist())
-        
-    print("最近邻索引 ID:", indices)
-    print("相似度分值:", distances)
 
-    return indices
+    prefixed_indices = [[f"evidence-{item}" for item in sublist] for sublist in indices]
 
-
-def search_number(evidence_dict, queries):
-    num_pattern = re.compile(r"[-+]?(?:\d*\.\d+|\d+)")
-    
-    ev_nums_list = []
-    ev_doc_ids_list = []
-    
-    # 2. 提取所有 evidence 中的数字并打平 (Flatten)
-    for doc_id, text in evidence_dict.items():
-        # 剔除常见的千分位逗号，防止 1,000 被识别为 1 和 000
-        clean_text = text.replace(",", "")
-        nums = [float(x) for x in num_pattern.findall(clean_text)]
-        
-        if nums:
-            ev_nums_list.extend(nums)
-            # 记录这些数字对应的 doc_id
-            ev_doc_ids_list.extend([doc_id] * len(nums))
-            
-    # 转为 NumPy 数组，利用 C 级别底层加速向量化比较
-    ev_nums_arr = np.array(ev_nums_list, dtype=np.float32)
-    ev_doc_ids_arr = np.array(ev_doc_ids_list)
-    
-    indices = []
-    
-    # 3. 批量处理 Queries
-    for q_text in queries:
-        clean_q_text = q_text.replace(",", "")
-        q_nums = [float(x) for x in num_pattern.findall(clean_q_text)]
-        
-        # 如果 Query 中没有数字，直接返回空列表
-        if not q_nums:
-            indices.append([])
-            continue
-            
-        hit_doc_ids = set()
-        
-        # 遍历 Query 中的每一个数字，计算区间并使用 Numpy 查找
-        for q_val in q_nums:
-            # 使用绝对值计算偏差，确保负数（如 -10 的 +-20% 是 [-12, -8]）逻辑正确
-            delta = 0.2 * abs(q_val)
-            lower_bound = q_val - delta
-            upper_bound = q_val + delta
-            
-            # 核心：向量化寻找落在区间内的数字索引
-            mask = (ev_nums_arr >= lower_bound) & (ev_nums_arr <= upper_bound)
-            
-            # 提取对应的 doc_ids 并加入集合去重
-            matched_ids = ev_doc_ids_arr[mask]
-            hit_doc_ids.update(matched_ids)
-            
-        # 将当前 query 命中的去重 doc_ids 存入结果
-        indices.append(list(hit_doc_ids))
-        
-    return indices
+    return prefixed_indices
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, help="输入运行模式，transformer | bm25 | number", default="bm25")
+    parser.add_argument("--mode", type=str, help="输入运行模式，transformer | bm25", default="bm25")
     args = parser.parse_args()
 
     evidence_dict = load_json_file('data/evidence/evidence.json')
 
-    if evidence_dict:
-        print(f"成功加载，字典包含 {len(evidence_dict)} 个一级键。")
+    with open('data/test-claims.json', 'r', encoding='utf-8') as f:
+        ground_truth = json.load(f)
+
+    test_dict = load_test_claims("data/test-claims.json")
+
+    if test_dict:
+        print(f"测试集成功加载，字典包含 {len(test_dict)} 个一级键。")
 
     if args.mode == "transformer":
         embeddings = embed(evidence_dict)
-
         if embeddings is not None:
-            print(f"成功嵌入，包含 {len(embeddings)} 个向量。")
+            print(f"证据集成功嵌入，包含 {len(embeddings)} 个向量。")
 
         index = write_index(embeddings)
-
         if index is not None:
             print("索引已创建。")
 
-        test_dict = load_test_claims("data/test-claims.json")
-
-        if test_dict:
-            print(f"成功加载，字典包含 {len(test_dict)} 个一级键。")
-
         embeddings = embed(test_dict)
-
-        indices = search(index, embeddings[4:5])[0]
-
-        for indice in indices:
-            key_name = f"evidence-{indice}"
-            evidence_text = evidence_dict.get(key_name, "未在本地字典中找到该证据")
-            print(f"Key: {key_name}, Value: {evidence_text}")
-
-        true_evidences = [
-            "evidence-52981",
-            "evidence-264761",
-            "evidence-947243",
-            "evidence-424102"
-        ]
-
-        print("True evidences:")
-
-        for true_evidence in true_evidences:
-            evidence_text = evidence_dict.get(true_evidence, "未在本地字典中找到该证据")
-            print(f"Key: {true_evidence}, Value: {evidence_text}")
+        prefixed_indices = search(index, embeddings, top_k=16)
 
         # 实验表明两个问题：
         # 1.embedding对词语分配的注意力有误，比如错误分配过多权重给"Greenland"，导致搜索结果里缺少对"iceburger"的匹配
@@ -290,33 +213,63 @@ if __name__ == "__main__":
 
     if args.mode == "bm25":
         bm25_matrix, meta_data = encode_bm25(evidence_dict)
+        sentences = list(test_dict.values())
+        prefixed_indices = search_bm25(sentences, bm25_matrix, meta_data, top_k=16)
 
-        queries = [
-            "Greenland has only lost a tiny fraction of its ice mass"
-        ]
+    # 安全检查：确保预测数量与真实标签数量一致
+    if len(prefixed_indices) != len(ground_truth):
+        print(f"警告：预测结果的数量 ({len(prefixed_indices)}) 与真实样本的数量 ({len(ground_truth)}) 不一致！")
 
-        # 执行检索
-        indices = search_bm25(queries, bm25_matrix, meta_data, top_k=5)[0]
+    # 1. 初始化统计变量
+    total_tp = 0  # 预测正确：在预测中，且在真实中
+    total_fp = 0  # 预测错误：在预测中，但不在真实中
+    total_fn = 0  # 漏报：不在预测中，但在真实中
 
-        # 打印结果
-        for indice in indices:
-            key_name = f"evidence-{indice}"
-            evidence_text = evidence_dict.get(key_name, "未在本地字典中找到该证据")
-            print(f"Key: {key_name}, Value: {evidence_text}")
+    predictions_dict = {}
 
-    if args.mode == "number":
-        queries = [
-            "Volcanoes emit around billion tonnes of CO per year."
-        ]
+    # 2. 遍历比对并构建新的预测字典
+    # 使用 zip 将真实数据和预测列表按顺序打包
+    for (claim_id, claim_data), predicted_evs in zip(ground_truth.items(), prefixed_indices):
+    
+        # 转换为集合 (Set) 以便进行高效的交集和差集运算
+        true_set = set(claim_data.get("evidences", []))
+        pred_set = set(predicted_evs)
+    
+        # 计算当前 claim 的 TP, FP, FN
+        tp = len(true_set.intersection(pred_set))
+        fp = len(pred_set - true_set)
+        fn = len(true_set - pred_set)
+    
+        # 累加到全局统计中
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+    
+        # 构建与原始格式相同的预测字典
+        predictions_dict[claim_id] = {
+            "claim_text": claim_data["claim_text"],
+            "claim_label": "UNLABELED", 
+            "evidences": list(pred_set) # 替换为预测出的 evidences
+        }
 
-        indices = search_number(evidence_dict, queries)[0]
+    # 3. 计算最终的 Precision, Recall 和 F1 Score
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
-        if not indices:
-            print("无数据。")
-        else:
-            for indice in indices:
-                evidence_text = evidence_dict.get(indice, "未在本地字典中找到该证据")
-                print(f"Key: {indice}, Value: {evidence_text}")
+    # 4. 打印结果
+    print("========== 评估结果 ==========")
+    print(f"准确率 (Precision): {precision:.4f} ({precision * 100:.2f}%)")
+    print(f"召回率 (Recall):    {recall:.4f} ({recall * 100:.2f}%)")
+    print(f"F1 Score:           {f1_score:.4f} ({f1_score * 100:.2f}%)")
+    print("==============================")
+
+    # 5. 保存为新的 JSON 文件
+    output_filename = 'predicted-claims.json'
+    with open(output_filename, 'w', encoding='utf-8') as f:
+        json.dump(predictions_dict, f, indent=4, ensure_ascii=False)
+
+    print(f"\n预测结果已成功保存至: {output_filename}")
 
 
 
