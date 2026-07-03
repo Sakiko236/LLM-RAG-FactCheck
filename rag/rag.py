@@ -29,6 +29,8 @@ def write_index(embeddings):
     index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
 
     sample_size = int(10e4)
+    # 如果数据量小于100,000，取实际长度
+    sample_size = min(sample_size, embeddings.shape[0])
     indices = np.random.choice(embeddings.shape[0], sample_size, replace=False)
     sampled_data = embeddings[indices]
     index.train(sampled_data)
@@ -98,7 +100,7 @@ def encode_bm25(input_dict, max_features=100000, k1=1.5, b=0.75):
     df = np.bincount(X.indices, minlength=X.shape[1]).astype(np.float32)
 
     idf = np.log(1.0 + (N - df + 0.5) / (df + 0.5)).astype(np.float32)
-    idf[idf < 0] = 0.0）
+    idf[idf < 0] = 0.0  # 已修复：将全角括号 '）' 修改为半角括号 ')'
 
     idf_diag = diags(idf)
     bm25_matrix = X_bm25_tf.dot(idf_diag)
@@ -150,9 +152,40 @@ def search_bm25(queries, bm25_matrix, meta_data, top_k=5):
     return prefixed_indices
 
 
+def reciprocal_rank_fusion(list1, list2, k=60, top_k=16):
+    """
+    通过 RRF 算法融合两个检索结果列表。
+    list1, list2 结构均为: [[doc1, doc2, ...], [doc1, doc2, ...], ...]
+    """
+    print(f"->正在进行 RRF 融合 (输出 top {top_k})...")
+    fused_results = []
+    for q_idx in range(len(list1)):
+        scores = {}
+        
+        # 处理第一个列表
+        for rank, doc_id in enumerate(list1[q_idx]):
+            if doc_id not in scores:
+                scores[doc_id] = 0.0
+            scores[doc_id] += 1.0 / (k + rank + 1)
+            
+        # 处理第二个列表
+        for rank, doc_id in enumerate(list2[q_idx]):
+            if doc_id not in scores:
+                scores[doc_id] = 0.0
+            scores[doc_id] += 1.0 / (k + rank + 1)
+            
+        # 按 RRF 得分降序排序
+        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        # 截取 top_k
+        fused_results.append([doc_id for doc_id, score in sorted_docs[:top_k]])
+        
+    return fused_results
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, help="输入运行模式，transformer | bm25 | concat", default="bm25")
+    # 新增 rrf 模式说明
+    parser.add_argument("--mode", type=str, help="输入运行模式，transformer | bm25 | rrf", default="bm25")
     args = parser.parse_args()
 
     evidence_dict = load_json_file('data/evidence/evidence.json')
@@ -177,14 +210,36 @@ if __name__ == "__main__":
         embeddings = embed(test_dict)
         prefixed_indices = search(index, embeddings, top_k=16)
 
-        # 实验表明两个问题：
-        # 1.embedding对词语分配的注意力有误，比如错误分配过多权重给"Greenland"，导致搜索结果里缺少对"iceburger"的匹配
-        # 2.embedding几乎无法匹配数字
-
     elif args.mode == "bm25":
         bm25_matrix, meta_data = encode_bm25(evidence_dict)
         sentences = list(test_dict.values())
         prefixed_indices = search_bm25(sentences, bm25_matrix, meta_data, top_k=16)
+
+    elif args.mode == "rrf":
+        # 融合时，先各自召回更多的候选文档（例如60个）有助于提升交叉排序的准确率
+        retrieve_pool_size = 60
+        
+        # 1. 运行 Transformer 召回
+        print("\n--- 第一步: 运行 Transformer 检索 ---")
+        dense_embeddings = embed(evidence_dict)
+        index = write_index(dense_embeddings)
+        test_embeddings = embed(test_dict)
+        transformer_indices = search(index, test_embeddings, top_k=retrieve_pool_size)
+        
+        # 2. 运行 BM25 召回
+        print("\n--- 第二步: 运行 BM25 检索 ---")
+        bm25_matrix, meta_data = encode_bm25(evidence_dict)
+        sentences = list(test_dict.values())
+        bm25_indices = search_bm25(sentences, bm25_matrix, meta_data, top_k=retrieve_pool_size)
+        
+        # 3. 运行 RRF 融合
+        print("\n--- 第三步: 运行倒排融合 (RRF) ---")
+        prefixed_indices = reciprocal_rank_fusion(
+            transformer_indices, 
+            bm25_indices, 
+            k=60, 
+            top_k=16
+        )
 
     if len(prefixed_indices) != len(ground_truth):
         print(f"警告：预测结果的数量 ({len(prefixed_indices)}) 与真实样本的数量 ({len(ground_truth)}) 不一致！")
